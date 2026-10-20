@@ -1,0 +1,1484 @@
+diff --git a/boxapi/go_http.go b/boxapi/go_http.go
+new file mode 100644
+index 000000000..3cba5ebce
+--- /dev/null
++++ b/boxapi/go_http.go
+@@ -0,0 +1,30 @@
++package boxapi
++
++import (
++	"context"
++	"net"
++	"net/http"
++	"time"
++
++	box "github.com/sagernet/sing-box"
++	"github.com/sagernet/sing-box/adapter"
++)
++
++func CreateProxyHttpClient(box *box.Box, tracker adapter.ConnectionTracker) *http.Client {
++	transport := &http.Transport{
++		TLSHandshakeTimeout:   time.Second * 3,
++		ResponseHeaderTimeout: time.Second * 3,
++	}
++
++	if box != nil {
++		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
++			return DialContext(ctx, box, tracker, network, addr)
++		}
++	}
++
++	client := &http.Client{
++		Transport: transport,
++	}
++
++	return client
++}
+diff --git a/boxapi/go_net.go b/boxapi/go_net.go
+new file mode 100644
+index 000000000..5a7637d1d
+--- /dev/null
++++ b/boxapi/go_net.go
+@@ -0,0 +1,23 @@
++package boxapi
++
++import (
++	"context"
++	"net"
++
++	box "github.com/sagernet/sing-box"
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/dialer"
++	"github.com/sagernet/sing/common/metadata"
++)
++
++func DialContext(ctx context.Context, box *box.Box, tracker adapter.ConnectionTracker, network, addr string) (net.Conn, error) {
++	defOutboundTag := box.Outbound().Default().Tag()
++	conn, err := dialer.NewDetour(box.Outbound(), defOutboundTag, true).DialContext(ctx, network, metadata.ParseSocksaddr(addr))
++	if err != nil {
++		return nil, err
++	}
++	if ss, ok := tracker.(*SbStatsService); ok {
++		conn = ss.RoutedConnectionInternal("", defOutboundTag, "", conn, false)
++	}
++	return conn, nil
++}
+diff --git a/boxapi/v2ray_server.go b/boxapi/v2ray_server.go
+new file mode 100644
+index 000000000..a97e0af5c
+--- /dev/null
++++ b/boxapi/v2ray_server.go
+@@ -0,0 +1,32 @@
++package boxapi
++
++import (
++	"context"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/option"
++)
++
++type SbV2rayServer struct {
++	ss *SbStatsService
++}
++
++func NewSbV2rayServer(options option.V2RayStatsServiceOptions) *SbV2rayServer {
++	return &SbV2rayServer{
++		ss: NewSbStatsService(options),
++	}
++}
++
++func (s *SbV2rayServer) Start() error                            { return nil }
++func (s *SbV2rayServer) Close() error                            { return nil }
++func (s *SbV2rayServer) StatsService() adapter.ConnectionTracker { return s.ss }
++
++// NekoRay style API
++
++func (s *SbV2rayServer) QueryStats(name string) int64 {
++	value, err := s.ss.GetStats(context.TODO(), name, true)
++	if err == nil {
++		return value
++	}
++	return 0
++}
+diff --git a/boxapi/v2ray_stats_service.go b/boxapi/v2ray_stats_service.go
+new file mode 100644
+index 000000000..3e96f42d4
+--- /dev/null
++++ b/boxapi/v2ray_stats_service.go
+@@ -0,0 +1,147 @@
++package boxapi
++
++import (
++	"context"
++	"net"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/bufio"
++	E "github.com/sagernet/sing/common/exceptions"
++	N "github.com/sagernet/sing/common/network"
++)
++
++type SbStatsService struct {
++	createdAt time.Time
++	inbounds  map[string]bool
++	outbounds map[string]bool
++	users     map[string]bool
++	access    sync.Mutex
++	counters  map[string]*atomic.Int64
++}
++
++func NewSbStatsService(options option.V2RayStatsServiceOptions) *SbStatsService {
++	if !options.Enabled {
++		return nil
++	}
++	inbounds := make(map[string]bool)
++	outbounds := make(map[string]bool)
++	users := make(map[string]bool)
++	for _, inbound := range options.Inbounds {
++		inbounds[inbound] = true
++	}
++	for _, outbound := range options.Outbounds {
++		outbounds[outbound] = true
++	}
++	for _, user := range options.Users {
++		users[user] = true
++	}
++	return &SbStatsService{
++		createdAt: time.Now(),
++		inbounds:  inbounds,
++		outbounds: outbounds,
++		users:     users,
++		counters:  make(map[string]*atomic.Int64),
++	}
++}
++
++func (s *SbStatsService) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
++	inbound := metadata.Inbound
++	user := metadata.User
++	outbound := matchOutbound.Tag()
++	return s.RoutedConnectionInternal(inbound, outbound, user, conn, true)
++}
++
++func (s *SbStatsService) RoutedConnectionInternal(inbound string, outbound string, user string, conn net.Conn, directIn bool) net.Conn {
++	var readCounter []*atomic.Int64
++	var writeCounter []*atomic.Int64
++	countInbound := inbound != "" && s.inbounds[inbound]
++	countOutbound := outbound != "" && s.outbounds[outbound]
++	countUser := user != "" && s.users[user]
++	if !countInbound && !countOutbound && !countUser {
++		return conn
++	}
++	s.access.Lock()
++	if countInbound {
++		readCounter = append(readCounter, s.loadOrCreateCounter("inbound>>>"+inbound+">>>traffic>>>uplink"))
++		writeCounter = append(writeCounter, s.loadOrCreateCounter("inbound>>>"+inbound+">>>traffic>>>downlink"))
++	}
++	if countOutbound {
++		readCounter = append(readCounter, s.loadOrCreateCounter("outbound>>>"+outbound+">>>traffic>>>uplink"))
++		writeCounter = append(writeCounter, s.loadOrCreateCounter("outbound>>>"+outbound+">>>traffic>>>downlink"))
++	}
++	if countUser {
++		readCounter = append(readCounter, s.loadOrCreateCounter("user>>>"+user+">>>traffic>>>uplink"))
++		writeCounter = append(writeCounter, s.loadOrCreateCounter("user>>>"+user+">>>traffic>>>downlink"))
++	}
++	s.access.Unlock()
++	if directIn {
++		conn = bufio.NewInt64CounterConn(conn, readCounter, writeCounter)
++	} else {
++		conn = bufio.NewInt64CounterConn(conn, writeCounter, readCounter)
++	}
++	return conn
++}
++
++func (s *SbStatsService) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) N.PacketConn {
++	inbound := metadata.Inbound
++	user := metadata.User
++	outbound := matchOutbound.Tag()
++	var readCounter []*atomic.Int64
++	var writeCounter []*atomic.Int64
++	countInbound := inbound != "" && s.inbounds[inbound]
++	countOutbound := outbound != "" && s.outbounds[outbound]
++	countUser := user != "" && s.users[user]
++	if !countInbound && !countOutbound && !countUser {
++		return conn
++	}
++	s.access.Lock()
++	if countInbound {
++		readCounter = append(readCounter, s.loadOrCreateCounter("inbound>>>"+inbound+">>>traffic>>>uplink"))
++		writeCounter = append(writeCounter, s.loadOrCreateCounter("inbound>>>"+inbound+">>>traffic>>>downlink"))
++	}
++	if countOutbound {
++		readCounter = append(readCounter, s.loadOrCreateCounter("outbound>>>"+outbound+">>>traffic>>>uplink"))
++		writeCounter = append(writeCounter, s.loadOrCreateCounter("outbound>>>"+outbound+">>>traffic>>>downlink"))
++	}
++	if countUser {
++		readCounter = append(readCounter, s.loadOrCreateCounter("user>>>"+user+">>>traffic>>>uplink"))
++		writeCounter = append(writeCounter, s.loadOrCreateCounter("user>>>"+user+">>>traffic>>>downlink"))
++	}
++	s.access.Unlock()
++	return bufio.NewInt64CounterPacketConn(conn, readCounter, nil, writeCounter, nil)
++}
++
++func (s *SbStatsService) GetStats(ctx context.Context, name string, reset bool) (int64, error) {
++	s.access.Lock()
++	counter, loaded := s.counters[name]
++	s.access.Unlock()
++	if !loaded {
++		return 0, E.New(name, " not found.")
++	}
++	var value int64
++	if reset {
++		value = counter.Swap(0)
++	} else {
++		value = counter.Load()
++	}
++	return value, nil
++}
++
++// QueryStats
++
++// GetSysStats
++
++//nolint:staticcheck
++func (s *SbStatsService) loadOrCreateCounter(name string) *atomic.Int64 {
++	counter, loaded := s.counters[name]
++	if loaded {
++		return counter
++	}
++	counter = &atomic.Int64{}
++	s.counters[name] = counter
++	return counter
++}
+diff --git a/common/conntrack/conn.go b/common/conntrack/conn.go
+new file mode 100644
+index 000000000..4773d6a82
+--- /dev/null
++++ b/common/conntrack/conn.go
+@@ -0,0 +1,54 @@
++package conntrack
++
++import (
++	"io"
++	"net"
++
++	"github.com/sagernet/sing/common/x/list"
++)
++
++type Conn struct {
++	net.Conn
++	element *list.Element[io.Closer]
++}
++
++func NewConn(conn net.Conn) (net.Conn, error) {
++	connAccess.Lock()
++	element := openConnection.PushBack(conn)
++	connAccess.Unlock()
++	if KillerEnabled {
++		err := KillerCheck()
++		if err != nil {
++			conn.Close()
++			return nil, err
++		}
++	}
++	return &Conn{
++		Conn:    conn,
++		element: element,
++	}, nil
++}
++
++func (c *Conn) Close() error {
++	if c.element.Value != nil {
++		connAccess.Lock()
++		if c.element.Value != nil {
++			openConnection.Remove(c.element)
++			c.element.Value = nil
++		}
++		connAccess.Unlock()
++	}
++	return c.Conn.Close()
++}
++
++func (c *Conn) Upstream() any {
++	return c.Conn
++}
++
++func (c *Conn) ReaderReplaceable() bool {
++	return true
++}
++
++func (c *Conn) WriterReplaceable() bool {
++	return true
++}
+diff --git a/common/conntrack/killer.go b/common/conntrack/killer.go
+new file mode 100644
+index 000000000..e0a71e5cb
+--- /dev/null
++++ b/common/conntrack/killer.go
+@@ -0,0 +1,35 @@
++package conntrack
++
++import (
++	runtimeDebug "runtime/debug"
++	"time"
++
++	E "github.com/sagernet/sing/common/exceptions"
++	"github.com/sagernet/sing/common/memory"
++)
++
++var (
++	KillerEnabled   bool
++	MemoryLimit     uint64
++	killerLastCheck time.Time
++)
++
++func KillerCheck() error {
++	if !KillerEnabled {
++		return nil
++	}
++	nowTime := time.Now()
++	if nowTime.Sub(killerLastCheck) < 3*time.Second {
++		return nil
++	}
++	killerLastCheck = nowTime
++	if memory.Total() > MemoryLimit {
++		Close()
++		go func() {
++			time.Sleep(time.Second)
++			runtimeDebug.FreeOSMemory()
++		}()
++		return E.New("out of memory")
++	}
++	return nil
++}
+diff --git a/common/conntrack/packet_conn.go b/common/conntrack/packet_conn.go
+new file mode 100644
+index 000000000..c7274637e
+--- /dev/null
++++ b/common/conntrack/packet_conn.go
+@@ -0,0 +1,55 @@
++package conntrack
++
++import (
++	"io"
++	"net"
++
++	"github.com/sagernet/sing/common/bufio"
++	"github.com/sagernet/sing/common/x/list"
++)
++
++type PacketConn struct {
++	net.PacketConn
++	element *list.Element[io.Closer]
++}
++
++func NewPacketConn(conn net.PacketConn) (net.PacketConn, error) {
++	connAccess.Lock()
++	element := openConnection.PushBack(conn)
++	connAccess.Unlock()
++	if KillerEnabled {
++		err := KillerCheck()
++		if err != nil {
++			conn.Close()
++			return nil, err
++		}
++	}
++	return &PacketConn{
++		PacketConn: conn,
++		element:    element,
++	}, nil
++}
++
++func (c *PacketConn) Close() error {
++	if c.element.Value != nil {
++		connAccess.Lock()
++		if c.element.Value != nil {
++			openConnection.Remove(c.element)
++			c.element.Value = nil
++		}
++		connAccess.Unlock()
++	}
++	return c.PacketConn.Close()
++}
++
++func (c *PacketConn) Upstream() any {
++	return bufio.NewPacketConn(c.PacketConn)
++}
++
++func (c *PacketConn) ReaderReplaceable() bool {
++	return true
++}
++
++func (c *PacketConn) WriterReplaceable() bool {
++	return true
++}
+diff --git a/common/conntrack/track.go b/common/conntrack/track.go
+new file mode 100644
+index 000000000..2c3e328b3
+--- /dev/null
++++ b/common/conntrack/track.go
+@@ -0,0 +1,47 @@
++package conntrack
++
++import (
++	"io"
++	"sync"
++
++	"github.com/sagernet/sing/common"
++	"github.com/sagernet/sing/common/x/list"
++)
++
++var (
++	connAccess     sync.RWMutex
++	openConnection list.List[io.Closer]
++)
++
++func Count() int {
++	if !Enabled {
++		return 0
++	}
++	return openConnection.Len()
++}
++
++func List() []io.Closer {
++	if !Enabled {
++		return nil
++	}
++	connAccess.RLock()
++	defer connAccess.RUnlock()
++	connList := make([]io.Closer, 0, openConnection.Len())
++	for element := openConnection.Front(); element != nil; element = element.Next() {
++		connList = append(connList, element.Value)
++	}
++	return connList
++}
++
++func Close() {
++	if !Enabled {
++		return
++	}
++	connAccess.Lock()
++	defer connAccess.Unlock()
++	for element := openConnection.Front(); element != nil; element = element.Next() {
++		common.Close(element.Value)
++		element.Value = nil
++	}
++	openConnection.Init()
++}
+diff --git a/common/conntrack/track_disable.go b/common/conntrack/track_disable.go
+new file mode 100644
+index 000000000..174d8b6eb
+--- /dev/null
++++ b/common/conntrack/track_disable.go
+@@ -0,0 +1,5 @@
++//go:build !with_conntrack
++
++package conntrack
++
++const Enabled = false
+diff --git a/common/conntrack/track_enable.go b/common/conntrack/track_enable.go
+new file mode 100644
+index 000000000..a4bf9986a
+--- /dev/null
++++ b/common/conntrack/track_enable.go
+@@ -0,0 +1,5 @@
++//go:build with_conntrack
++
++package conntrack
++
++const Enabled = true
+diff --git a/common/dialer/default.go b/common/dialer/default.go
+index ccdfbafbb..5256fe8d0 100644
+--- a/common/dialer/default.go
++++ b/common/dialer/default.go
+@@ -22,6 +22,8 @@ import (
+ 	"github.com/database64128/tfo-go/v2"
+ )
+ 
++var DoNotSelectInterface = false
++
+ var (
+ 	_ ParallelInterfaceDialer = (*DefaultDialer)(nil)
+ 	_ WireGuardListener       = (*DefaultDialer)(nil)
+@@ -249,7 +251,7 @@ func (d *DefaultDialer) DialContext(ctx context.Context, network string, address
+ 	} else if address.IsDomain() {
+ 		return nil, E.New("domain not resolved")
+ 	}
+-	if d.networkStrategy == nil {
++	if DoNotSelectInterface || d.networkStrategy == nil {
+ 		return d.trackConn(listener.ListenNetworkNamespace[net.Conn](d.netns, func() (net.Conn, error) {
+ 			switch N.NetworkName(network) {
+ 			case N.NetworkUDP:
+@@ -319,7 +321,7 @@ func (d *DefaultDialer) DialParallelInterface(ctx context.Context, network strin
+ }
+ 
+ func (d *DefaultDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+-	if d.networkStrategy == nil {
++	if DoNotSelectInterface || d.networkStrategy == nil {
+ 		return d.trackPacketConn(listener.ListenNetworkNamespace[net.PacketConn](d.netns, func() (net.PacketConn, error) {
+ 			listenConfig := d.udpListener
+ 			if d.autoDetectBindFunc != nil && destination.Addr.IsValid() {
+diff --git a/constant/proxy.go b/constant/proxy.go
+index 278a46c2f..64c76b208 100644
+--- a/constant/proxy.go
++++ b/constant/proxy.go
+@@ -9,6 +9,7 @@ const (
+ 	TypeDNS          = "dns"
+ 	TypeSOCKS        = "socks"
+ 	TypeHTTP         = "http"
++	TypeTURN         = "turn"
+ 	TypeMixed        = "mixed"
+ 	TypeShadowsocks  = "shadowsocks"
+ 	TypeVMess        = "vmess"
+@@ -56,6 +57,8 @@ func ProxyDisplayName(proxyType string) string {
+ 		return "SOCKS"
+ 	case TypeHTTP:
+ 		return "HTTP"
++	case TypeTURN:
++		return "TURN"
+ 	case TypeMixed:
+ 		return "Mixed"
+ 	case TypeShadowsocks:
+diff --git a/go.mod b/go.mod
+index 6f8e242e1..c474b1557 100644
+--- a/go.mod
++++ b/go.mod
+@@ -101,6 +101,13 @@ require (
+ 	github.com/mdlayher/socket v0.5.1 // indirect
+ 	github.com/mitchellh/go-ps v1.0.0 // indirect
+ 	github.com/pierrec/lz4/v4 v4.1.21 // indirect
++	github.com/pion/dtls/v3 v3.0.7 // indirect
++	github.com/pion/logging v0.2.4 // indirect
++	github.com/pion/randutil v0.1.0 // indirect
++	github.com/pion/stun/v3 v3.0.1 // indirect
++	github.com/pion/transport/v3 v3.0.8 // indirect
++	github.com/pion/transport/v4 v4.0.1 // indirect
++	github.com/pion/turn/v4 v4.1.4 // indirect
+ 	github.com/pires/go-proxyproto v0.8.1 // indirect
+ 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
+ 	github.com/prometheus-community/pro-bing v0.4.0 // indirect
+@@ -150,6 +157,7 @@ require (
+ 	github.com/tidwall/pretty v1.2.1 // indirect
+ 	github.com/tidwall/sjson v1.2.5 // indirect
+ 	github.com/u-root/uio v0.0.0-20240224005618-d2acac8f3701 // indirect
++	github.com/wlynxg/anet v0.0.5 // indirect
+ 	github.com/x448/float16 v0.8.4 // indirect
+ 	github.com/zeebo/blake3 v0.2.4 // indirect
+ 	go.uber.org/multierr v1.11.0 // indirect
+diff --git a/go.sum b/go.sum
+index 6ab540be4..2138bdb35 100644
+--- a/go.sum
++++ b/go.sum
+@@ -144,6 +144,20 @@ github.com/oschwald/maxminddb-golang v1.13.1 h1:G3wwjdN9JmIK2o/ermkHM+98oX5fS+k5
+ github.com/oschwald/maxminddb-golang v1.13.1/go.mod h1:K4pgV9N/GcK694KSTmVSDTODk4IsCNThNdTmnaBZ/F8=
+ github.com/pierrec/lz4/v4 v4.1.21 h1:yOVMLb6qSIDP67pl/5F7RepeKYu/VmTyEXvuMI5d9mQ=
+ github.com/pierrec/lz4/v4 v4.1.21/go.mod h1:gZWDp/Ze/IJXGXf23ltt2EXimqmTUXEy0GFuRQyBid4=
++github.com/pion/dtls/v3 v3.0.7 h1:bItXtTYYhZwkPFk4t1n3Kkf5TDrfj6+4wG+CZR8uI9Q=
++github.com/pion/dtls/v3 v3.0.7/go.mod h1:uDlH5VPrgOQIw59irKYkMudSFprY9IEFCqz/eTz16f8=
++github.com/pion/logging v0.2.4 h1:tTew+7cmQ+Mc1pTBLKH2puKsOvhm32dROumOZ655zB8=
++github.com/pion/logging v0.2.4/go.mod h1:DffhXTKYdNZU+KtJ5pyQDjvOAh/GsNSyv1lbkFbe3so=
++github.com/pion/randutil v0.1.0 h1:CFG1UdESneORglEsnimhUjf33Rwjubwj6xfiOXBa3mA=
++github.com/pion/randutil v0.1.0/go.mod h1:XcJrSMMbbMRhASFVOlj/5hQial/Y8oH/HVo7TBZq+j8=
++github.com/pion/stun/v3 v3.0.1 h1:jx1uUq6BdPihF0yF33Jj2mh+C9p0atY94IkdnW174kA=
++github.com/pion/stun/v3 v3.0.1/go.mod h1:RHnvlKFg+qHgoKIqtQWMOJF52wsImCAf/Jh5GjX+4Tw=
++github.com/pion/transport/v3 v3.0.8 h1:oI3myyYnTKUSTthu/NZZ8eu2I5sHbxbUNNFW62olaYc=
++github.com/pion/transport/v3 v3.0.8/go.mod h1:+c2eewC5WJQHiAA46fkMMzoYZSuGzA/7E2FPrOYHctQ=
++github.com/pion/transport/v4 v4.0.1 h1:sdROELU6BZ63Ab7FrOLn13M6YdJLY20wldXW2Cu2k8o=
++github.com/pion/transport/v4 v4.0.1/go.mod h1:nEuEA4AD5lPdcIegQDpVLgNoDGreqM/YqmEx3ovP4jM=
++github.com/pion/turn/v4 v4.1.4 h1:EU11yMXKIsK43FhcUnjLlrhE4nboHZq+TXBIi3QpcxQ=
++github.com/pion/turn/v4 v4.1.4/go.mod h1:ES1DXVFKnOhuDkqn9hn5VJlSWmZPaRJLyBXoOeO/BmQ=
+ github.com/pires/go-proxyproto v0.8.1 h1:9KEixbdJfhrbtjpz/ZwCdWDD2Xem0NZ38qMYaASJgp0=
+ github.com/pires/go-proxyproto v0.8.1/go.mod h1:ZKAAyp3cgy5Y5Mo4n9AlScrkCZwUy0g3Jf+slqQVcuU=
+ github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
+@@ -299,6 +313,8 @@ github.com/u-root/uio v0.0.0-20240224005618-d2acac8f3701/go.mod h1:P3a5rG4X7tI17
+ github.com/vishvananda/netns v0.0.0-20200728191858-db3c7e526aae/go.mod h1:DD4vA1DwXk04H54A1oHXtwZmA0grkVMdPxx/VGLCah0=
+ github.com/vishvananda/netns v0.0.5 h1:DfiHV+j8bA32MFM7bfEunvT8IAqQ/NzSJHtcmW5zdEY=
+ github.com/vishvananda/netns v0.0.5/go.mod h1:SpkAiCQRtJ6TvvxPnOSyH3BMl6unz3xZlaprSwhNNJM=
++github.com/wlynxg/anet v0.0.5 h1:J3VJGi1gvo0JwZ/P1/Yc/8p63SoW98B5dHkYDmpgvvU=
++github.com/wlynxg/anet v0.0.5/go.mod h1:eay5PRQr7fIVAMbTbchTnO9gG65Hg/uYGdc7mguHxoA=
+ github.com/x448/float16 v0.8.4 h1:qLwI1I70+NjRFUR3zs1JPUCgaCXSh3SW62uAKT1mSBM=
+ github.com/x448/float16 v0.8.4/go.mod h1:14CWIYCyZA/cWjXOioeEpHeN/83MdbZDRQHoFcYsOfg=
+ github.com/zeebo/assert v1.1.0 h1:hU1L1vLTHsnO8x8c9KAR5GmM5QscxHg5RNU5z5qbUWY=
+diff --git a/include/registry.go b/include/registry.go
+index f090845b5..c91737a16 100644
+--- a/include/registry.go
++++ b/include/registry.go
+@@ -32,8 +32,10 @@ import (
+ 	"github.com/sagernet/sing-box/protocol/tor"
+ 	"github.com/sagernet/sing-box/protocol/trojan"
+ 	"github.com/sagernet/sing-box/protocol/tun"
++	"github.com/sagernet/sing-box/protocol/turn"
+ 	"github.com/sagernet/sing-box/protocol/vless"
+ 	"github.com/sagernet/sing-box/protocol/vmess"
++	"github.com/sagernet/sing-box/protocol/wireguard"
+ 	"github.com/sagernet/sing-box/service/resolved"
+ 	"github.com/sagernet/sing-box/service/ssmapi"
+ 	E "github.com/sagernet/sing/common/exceptions"
+@@ -90,8 +92,11 @@ func OutboundRegistry() *outbound.Registry {
+ 	shadowtls.RegisterOutbound(registry)
+ 	vless.RegisterOutbound(registry)
+ 	anytls.RegisterOutbound(registry)
++	turn.RegisterOutbound(registry)
++	wireguard.RegisterOutbound(registry)
+ 
+ 	registerQUICOutbounds(registry)
++
+ 	registerStubForRemovedOutbounds(registry)
+ 
+ 	return registry
+diff --git a/nekoutils/callback.go b/nekoutils/callback.go
+new file mode 100644
+index 000000000..97f561236
+--- /dev/null
++++ b/nekoutils/callback.go
+@@ -0,0 +1,3 @@
++package nekoutils
++
++var Selector_OnProxySelected func(selectorTag string, tag string)
+diff --git a/nekoutils/srs.go b/nekoutils/srs.go
+new file mode 100644
+index 000000000..a86df58a7
+--- /dev/null
++++ b/nekoutils/srs.go
+@@ -0,0 +1,7 @@
++package nekoutils
++
++import "github.com/sagernet/sing-box/option"
++
++var GetGeoIPHeadlessRules func(name string) ([]option.HeadlessRule, error)
++
++var GetGeoSiteHeadlessRules func(name string) ([]option.HeadlessRule, error)
+diff --git a/option/simple.go b/option/simple.go
+index f244ba18b..a161f6b26 100644
+--- a/option/simple.go
++++ b/option/simple.go
+@@ -38,3 +38,14 @@ type HTTPOutboundOptions struct {
+ 	Path    string               `json:"path,omitempty"`
+ 	Headers badoption.HTTPHeader `json:"headers,omitempty"`
+ }
++
++// TURNOutboundOptions configures a direct TURN relay outbound.
++type TURNOutboundOptions struct {
++	DialerOptions
++	ServerOptions
++	Username         string      `json:"username,omitempty"`
++	Password         string      `json:"password,omitempty"`
++	Network          NetworkList `json:"network,omitempty"`
++	ControlTransport string      `json:"control_transport,omitempty"`
++	OutboundTLSOptionsContainer
++}
+diff --git a/option/wireguard.go b/option/wireguard.go
+index c86abd112..e29c04c03 100644
+--- a/option/wireguard.go
++++ b/option/wireguard.go
+@@ -28,3 +28,30 @@ type WireGuardPeer struct {
+ 	PersistentKeepaliveInterval uint16                           `json:"persistent_keepalive_interval,omitempty"`
+ 	Reserved                    []uint8                          `json:"reserved,omitempty"`
+ }
++
++// LegacyWireGuardOutboundOptions is kept for compatibility with clients that
++// still use the legacy wireguard outbound instead of the endpoint API.
++type LegacyWireGuardOutboundOptions struct {
++	DialerOptions
++	SystemInterface bool                             `json:"system_interface,omitempty"`
++	GSO             bool                             `json:"gso,omitempty"`
++	InterfaceName   string                           `json:"interface_name,omitempty"`
++	LocalAddress    badoption.Listable[netip.Prefix] `json:"local_address"`
++	PrivateKey      string                           `json:"private_key"`
++	Peers           []LegacyWireGuardPeer            `json:"peers,omitempty"`
++	ServerOptions
++	PeerPublicKey string      `json:"peer_public_key"`
++	PreSharedKey  string      `json:"pre_shared_key,omitempty"`
++	Reserved      []uint8     `json:"reserved,omitempty"`
++	Workers       int         `json:"workers,omitempty"`
++	MTU           uint32      `json:"mtu,omitempty"`
++	Network       NetworkList `json:"network,omitempty"`
++}
++
++type LegacyWireGuardPeer struct {
++	ServerOptions
++	PublicKey    string                           `json:"public_key,omitempty"`
++	PreSharedKey string                           `json:"pre_shared_key,omitempty"`
++	AllowedIPs   badoption.Listable[netip.Prefix] `json:"allowed_ips,omitempty"`
++	Reserved     []uint8                          `json:"reserved,omitempty"`
++}
+diff --git a/protocol/group/selector.go b/protocol/group/selector.go
+index f3f7377b6..20ed9d2d2 100644
+--- a/protocol/group/selector.go
++++ b/protocol/group/selector.go
+@@ -9,6 +9,7 @@ import (
+ 	"github.com/sagernet/sing-box/adapter/outbound"
+ 	"github.com/sagernet/sing-box/common/interrupt"
+ 	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/nekoutils"
+ 	"github.com/sagernet/sing-box/log"
+ 	"github.com/sagernet/sing-box/option"
+ 	tun "github.com/sagernet/sing-tun"
+@@ -137,6 +138,9 @@ func (s *Selector) SelectOutbound(tag string) bool {
+ 		}
+ 	}
+ 	s.interruptGroup.Interrupt(s.interruptExternalConnections)
++	if nekoutils.Selector_OnProxySelected != nil {
++		nekoutils.Selector_OnProxySelected(s.Tag(), tag)
++	}
+ 	return true
+ }
+ 
+diff --git a/protocol/turn/outbound.go b/protocol/turn/outbound.go
+new file mode 100644
+index 000000000..54c80b219
+--- /dev/null
++++ b/protocol/turn/outbound.go
+@@ -0,0 +1,479 @@
++package turn
++
++import (
++	"context"
++	"errors"
++	"io"
++	"net"
++	"net/netip"
++	"os"
++	"strconv"
++	"sync"
++	"time"
++
++	"github.com/pion/transport/v4"
++	pionstdnet "github.com/pion/transport/v4/stdnet"
++	pionturn "github.com/pion/turn/v4"
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/adapter/outbound"
++	"github.com/sagernet/sing-box/common/dialer"
++	singtls "github.com/sagernet/sing-box/common/tls"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common"
++	E "github.com/sagernet/sing/common/exceptions"
++	"github.com/sagernet/sing/common/logger"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++	"github.com/sagernet/sing/service"
++)
++
++func RegisterOutbound(registry *outbound.Registry) {
++	outbound.Register[option.TURNOutboundOptions](registry, C.TypeTURN, NewOutbound)
++}
++
++var _ adapter.Outbound = (*Outbound)(nil)
++
++type Outbound struct {
++	outbound.Adapter
++	ctx              context.Context
++	logger           logger.ContextLogger
++	dnsRouter        adapter.DNSRouter
++	controlDialer    N.Dialer
++	dataDialer       N.Dialer
++	server           M.Socksaddr
++	username         string
++	password         string
++	network          []string
++	controlTransport string
++}
++
++func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TURNOutboundOptions) (adapter.Outbound, error) {
++	if options.Server == "" {
++		return nil, E.New("missing TURN server")
++	}
++	if options.ServerPort == 0 {
++		options.ServerPort = 3478
++	}
++	controlTransport := options.ControlTransport
++	if controlTransport == "" {
++		controlTransport = "udp"
++	}
++	if controlTransport != "udp" && controlTransport != "tcp" && controlTransport != "tls" {
++		return nil, E.New("unknown TURN control transport: ", controlTransport)
++	}
++
++	outboundDialer, err := dialer.New(ctx, options.DialerOptions, options.ServerIsDomain())
++	if err != nil {
++		return nil, err
++	}
++
++	dataDialer := outboundDialer
++	controlDialer := outboundDialer
++	if controlTransport == "tls" {
++		tlsOptions := common.PtrValueOrDefault(options.TLS)
++		tlsOptions.Enabled = true
++		controlDialer, err = singtls.NewDialerFromOptions(ctx, logger, outboundDialer, options.Server, tlsOptions)
++		if err != nil {
++			return nil, err
++		}
++	} else if options.TLS != nil && options.TLS.Enabled {
++		return nil, E.New("TURN TLS requires control_transport=tls")
++	}
++
++	return &Outbound{
++		Adapter:       outbound.NewAdapterWithDialerOptions(C.TypeTURN, tag, options.Network.Build(), options.DialerOptions),
++		ctx:           ctx,
++		logger:        logger,
++		dnsRouter:     service.FromContext[adapter.DNSRouter](ctx),
++		controlDialer: controlDialer,
++		dataDialer:    dataDialer,
++
++		server:           options.ServerOptions.Build(),
++		username:         options.Username,
++		password:         options.Password,
++		network:          options.Network.Build(),
++		controlTransport: controlTransport,
++	}, nil
++}
++
++func (o *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++	network = N.NetworkName(network)
++	switch network {
++	case N.NetworkTCP:
++		if !o.supports(N.NetworkTCP) {
++			return nil, os.ErrInvalid
++		}
++		peer, err := o.resolvePeer(ctx, destination, true)
++		if err != nil {
++			return nil, err
++		}
++		session, err := o.newSession(ctx)
++		if err != nil {
++			return nil, err
++		}
++		allocation, err := session.client.AllocateTCP()
++		if err != nil {
++			session.Close()
++			return nil, err
++		}
++		conn, err := allocation.DialTCP("tcp", nil, peer.(*net.TCPAddr))
++		if err != nil {
++			_ = allocation.Close()
++			session.Close()
++			return nil, err
++		}
++		session.allocation = allocation
++		return &managedConn{Conn: conn, session: session}, nil
++	case N.NetworkUDP:
++		if !o.supports(N.NetworkUDP) {
++			return nil, os.ErrInvalid
++		}
++		peer, err := o.resolvePeer(ctx, destination, false)
++		if err != nil {
++			return nil, err
++		}
++		packetConn, err := o.ListenPacket(ctx, destination)
++		if err != nil {
++			return nil, err
++		}
++		return &connectedPacketConn{PacketConn: packetConn, remote: peer}, nil
++	default:
++		return nil, E.Extend(N.ErrUnknownNetwork, network)
++	}
++}
++
++func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
++	if !o.supports(N.NetworkUDP) {
++		return nil, os.ErrInvalid
++	}
++	session, err := o.newSession(ctx)
++	if err != nil {
++		return nil, err
++	}
++	allocation, err := session.client.Allocate()
++	if err != nil {
++		session.Close()
++		return nil, err
++	}
++	session.allocation = allocation
++	return &managedPacketConn{
++		PacketConn: allocation,
++		session:    session,
++		dnsRouter:  o.dnsRouter,
++	}, nil
++}
++
++func (o *Outbound) supports(network string) bool {
++	for _, item := range o.network {
++		if item == network {
++			return true
++		}
++	}
++	return false
++}
++
++func (o *Outbound) resolvePeer(ctx context.Context, destination M.Socksaddr, tcp bool) (net.Addr, error) {
++	if destination.IsIP() {
++		if tcp {
++			return destination.TCPAddr(), nil
++		}
++		return destination.UDPAddr(), nil
++	}
++	if o.dnsRouter == nil {
++		return nil, E.New("missing DNS router for TURN destination: ", destination.Fqdn)
++	}
++	addresses, err := o.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
++	if err != nil {
++		return nil, err
++	}
++	if len(addresses) == 0 {
++		return nil, E.New("DNS lookup returned no address for TURN destination: ", destination.Fqdn)
++	}
++	if tcp {
++		return &net.TCPAddr{IP: addresses[0].AsSlice(), Port: int(destination.Port)}, nil
++	}
++	return &net.UDPAddr{IP: addresses[0].AsSlice(), Port: int(destination.Port)}, nil
++}
++
++func (o *Outbound) resolveServer(ctx context.Context) (netip.Addr, error) {
++	if o.server.IsIP() {
++		if o.server.Addr.Is6() {
++			return netip.Addr{}, E.New("TURN server IPv6 is not supported by the current TURN client")
++		}
++		return o.server.Addr, nil
++	}
++	if o.dnsRouter == nil {
++		return netip.Addr{}, E.New("missing DNS router for TURN server: ", o.server.Fqdn)
++	}
++	addresses, err := o.dnsRouter.Lookup(ctx, o.server.Fqdn, adapter.DNSQueryOptions{})
++	if err != nil {
++		return netip.Addr{}, err
++	}
++	if len(addresses) == 0 {
++		return netip.Addr{}, E.New("DNS lookup returned no address for TURN server: ", o.server.Fqdn)
++	}
++	for _, address := range addresses {
++		if address.Is4() {
++			return address, nil
++		}
++	}
++	return netip.Addr{}, E.New("TURN server has no IPv4 address: ", o.server.Fqdn)
++}
++
++func (o *Outbound) newSession(ctx context.Context) (*session, error) {
++	serverIP, err := o.resolveServer(ctx)
++	if err != nil {
++		return nil, err
++	}
++	server := M.SocksaddrFrom(serverIP, o.server.Port)
++
++	var control net.PacketConn
++	if o.controlTransport == "udp" {
++		control, err = o.controlDialer.ListenPacket(ctx, server)
++		if err != nil {
++			return nil, err
++		}
++	} else {
++		conn, dialErr := o.controlDialer.DialContext(ctx, N.NetworkTCP, server)
++		if dialErr != nil {
++			return nil, dialErr
++		}
++		control = pionturn.NewSTUNConn(conn)
++	}
++
++	stdNet, err := pionstdnet.NewNet()
++	if err != nil {
++		_ = control.Close()
++		return nil, err
++	}
++	pionNet := &pionNet{
++		Net:    stdNet,
++		ctx:    ctx,
++		dialer: o.dataDialer,
++	}
++	client, err := pionturn.NewClient(&pionturn.ClientConfig{
++		TURNServerAddr: net.JoinHostPort(serverIP.String(), strconv.Itoa(int(server.Port))),
++		Username:       o.username,
++		Password:       o.password,
++		Conn:           control,
++		Net:            pionNet,
++	})
++	if err != nil {
++		_ = control.Close()
++		return nil, err
++	}
++	if err = client.Listen(); err != nil {
++		client.Close()
++		_ = control.Close()
++		return nil, err
++	}
++	return &session{client: client, control: control}, nil
++}
++
++type session struct {
++	client     *pionturn.Client
++	control    net.PacketConn
++	allocation interface{ Close() error }
++	once       sync.Once
++}
++
++func (s *session) Close() error {
++	var err error
++	s.once.Do(func() {
++		if s.allocation != nil {
++			err = s.allocation.Close()
++		}
++		s.client.Close()
++		errControl := s.control.Close()
++		if err == nil {
++			err = errControl
++		}
++	})
++	return err
++}
++
++type managedConn struct {
++	net.Conn
++	session *session
++	once    sync.Once
++	err     error
++}
++
++func (c *managedConn) Close() error {
++	c.once.Do(func() {
++		c.err = c.Conn.Close()
++		if sessionErr := c.session.Close(); c.err == nil {
++			c.err = sessionErr
++		}
++	})
++	return c.err
++}
++
++type managedPacketConn struct {
++	net.PacketConn
++	session   *session
++	dnsRouter adapter.DNSRouter
++	once      sync.Once
++	err       error
++}
++
++func (c *managedPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
++	return c.PacketConn.ReadFrom(p)
++}
++
++func (c *managedPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
++	resolved, err := resolveUDPAddr(context.Background(), c.dnsRouter, addr)
++	if err != nil {
++		return 0, err
++	}
++	return c.PacketConn.WriteTo(p, resolved)
++}
++
++func (c *managedPacketConn) Close() error {
++	c.once.Do(func() {
++		c.err = c.session.Close()
++	})
++	return c.err
++}
++
++type connectedPacketConn struct {
++	net.PacketConn
++	remote net.Addr
++}
++
++func (c *connectedPacketConn) Read(p []byte) (int, error) {
++	n, _, err := c.PacketConn.ReadFrom(p)
++	return n, err
++}
++
++func (c *connectedPacketConn) Write(p []byte) (int, error) {
++	return c.PacketConn.WriteTo(p, c.remote)
++}
++
++func (c *connectedPacketConn) RemoteAddr() net.Addr {
++	return c.remote
++}
++
++func (c *connectedPacketConn) LocalAddr() net.Addr {
++	return c.PacketConn.LocalAddr()
++}
++
++func (c *connectedPacketConn) SetDeadline(t time.Time) error {
++	return c.PacketConn.SetDeadline(t)
++}
++
++func (c *connectedPacketConn) SetReadDeadline(t time.Time) error {
++	return c.PacketConn.SetReadDeadline(t)
++}
++
++func (c *connectedPacketConn) SetWriteDeadline(t time.Time) error {
++	return c.PacketConn.SetWriteDeadline(t)
++}
++
++func resolveUDPAddr(ctx context.Context, dnsRouter adapter.DNSRouter, addr net.Addr) (*net.UDPAddr, error) {
++	switch value := addr.(type) {
++	case *net.UDPAddr:
++		return value, nil
++	case M.Socksaddr:
++		if value.IsIP() {
++			return value.UDPAddr(), nil
++		}
++		if dnsRouter == nil {
++			return nil, errors.New("missing DNS router for TURN UDP peer")
++		}
++		addresses, err := dnsRouter.Lookup(ctx, value.Fqdn, adapter.DNSQueryOptions{})
++		if err != nil {
++			return nil, err
++		}
++		if len(addresses) == 0 {
++			return nil, errors.New("DNS lookup returned no TURN UDP peer")
++		}
++		return &net.UDPAddr{IP: addresses[0].AsSlice(), Port: int(value.Port)}, nil
++	default:
++		return nil, E.New("unsupported TURN UDP peer address: ", addr)
++	}
++}
++
++type pionNet struct {
++	*pionstdnet.Net
++	ctx    context.Context
++	dialer N.Dialer
++}
++
++func (n *pionNet) DialTCP(network string, laddr, raddr *net.TCPAddr) (transport.TCPConn, error) {
++	ip, ok := netip.AddrFromSlice(raddr.IP)
++	if !ok {
++		return nil, E.New("invalid TURN TCP server address: ", raddr)
++	}
++	conn, err := n.dialer.DialContext(n.ctx, N.NetworkTCP, M.SocksaddrFrom(ip, uint16(raddr.Port)))
++	if err != nil {
++		return nil, err
++	}
++	return &tcpConn{Conn: conn}, nil
++}
++
++type tcpConn struct {
++	net.Conn
++}
++
++func (c *tcpConn) CloseRead() error {
++	if conn, ok := c.Conn.(interface{ CloseRead() error }); ok {
++		return conn.CloseRead()
++	}
++	return nil
++}
++
++func (c *tcpConn) CloseWrite() error {
++	if conn, ok := c.Conn.(interface{ CloseWrite() error }); ok {
++		return conn.CloseWrite()
++	}
++	return nil
++}
++
++func (c *tcpConn) ReadFrom(r io.Reader) (int64, error) {
++	return io.Copy(c.Conn, r)
++}
++
++func (c *tcpConn) SetLinger(sec int) error {
++	if conn, ok := c.Conn.(interface{ SetLinger(int) error }); ok {
++		return conn.SetLinger(sec)
++	}
++	return nil
++}
++
++func (c *tcpConn) SetKeepAlive(keepalive bool) error {
++	if conn, ok := c.Conn.(interface{ SetKeepAlive(bool) error }); ok {
++		return conn.SetKeepAlive(keepalive)
++	}
++	return nil
++}
++
++func (c *tcpConn) SetKeepAlivePeriod(period time.Duration) error {
++	if conn, ok := c.Conn.(interface{ SetKeepAlivePeriod(time.Duration) error }); ok {
++		return conn.SetKeepAlivePeriod(period)
++	}
++	return nil
++}
++
++func (c *tcpConn) SetNoDelay(noDelay bool) error {
++	if conn, ok := c.Conn.(interface{ SetNoDelay(bool) error }); ok {
++		return conn.SetNoDelay(noDelay)
++	}
++	return nil
++}
++
++func (c *tcpConn) SetWriteBuffer(bytes int) error {
++	if conn, ok := c.Conn.(interface{ SetWriteBuffer(int) error }); ok {
++		return conn.SetWriteBuffer(bytes)
++	}
++	return nil
++}
++
++func (c *tcpConn) SetReadBuffer(bytes int) error {
++	if conn, ok := c.Conn.(interface{ SetReadBuffer(int) error }); ok {
++		return conn.SetReadBuffer(bytes)
++	}
++	return nil
++}
+diff --git a/protocol/turn/outbound_integration_test.go b/protocol/turn/outbound_integration_test.go
+new file mode 100644
+index 000000000..be5e8c9a5
+--- /dev/null
++++ b/protocol/turn/outbound_integration_test.go
+@@ -0,0 +1,102 @@
++package turn
++
++import (
++	"context"
++	"net"
++	"testing"
++	"time"
++
++	pionturn "github.com/pion/turn/v4"
++	"github.com/sagernet/sing-box/common/dialer"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++)
++
++func TestLocalTURNUDPRelay(t *testing.T) {
++	turnListener, err := net.ListenPacket("udp4", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer turnListener.Close()
++	turnAddr := turnListener.LocalAddr().(*net.UDPAddr)
++	turnTCPListener, err := net.Listen("tcp4", turnAddr.String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer turnTCPListener.Close()
++
++	echoListener, err := net.ListenPacket("udp4", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer echoListener.Close()
++	go func() {
++		buf := make([]byte, 2048)
++		for {
++			n, addr, readErr := echoListener.ReadFrom(buf)
++			if readErr != nil {
++				return
++			}
++			_, _ = echoListener.WriteTo(buf[:n], addr)
++		}
++	}()
++
++	server, err := pionturn.NewServer(pionturn.ServerConfig{
++		Realm: "pion.ly",
++		AuthHandler: func(username, realm string, _ net.Addr) ([]byte, bool) {
++			if username != "user" || realm != "pion.ly" {
++				return nil, false
++			}
++			return pionturn.GenerateAuthKey("user", "pion.ly", "pass"), true
++		},
++		PacketConnConfigs: []pionturn.PacketConnConfig{{
++			PacketConn: turnListener,
++			RelayAddressGenerator: &pionturn.RelayAddressGeneratorStatic{
++				RelayAddress: net.ParseIP("127.0.0.1"),
++				Address:      "127.0.0.1",
++			},
++		}},
++		ListenerConfigs: []pionturn.ListenerConfig{{
++			Listener: turnTCPListener,
++			RelayAddressGenerator: &pionturn.RelayAddressGeneratorStatic{
++				RelayAddress: net.ParseIP("127.0.0.1"),
++				Address:      "127.0.0.1",
++			},
++		}},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer server.Close()
++
++	targetAddr := echoListener.LocalAddr().(*net.UDPAddr)
++	o := &Outbound{
++		controlDialer:    &dialer.DefaultDialer{},
++		dataDialer:       &dialer.DefaultDialer{},
++		server:           M.ParseSocksaddrHostPort("127.0.0.1", uint16(turnAddr.Port)),
++		username:         "user",
++		password:         "pass",
++		network:          []string{N.NetworkUDP},
++		controlTransport: "tcp",
++	}
++
++	packetConn, err := o.ListenPacket(context.Background(), M.ParseSocksaddrHostPort("127.0.0.1", uint16(targetAddr.Port)))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer packetConn.Close()
++	if _, err = packetConn.WriteTo([]byte("turn-ok"), targetAddr); err != nil {
++		t.Fatal(err)
++	}
++	if err = packetConn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
++		t.Fatal(err)
++	}
++	buf := make([]byte, 64)
++	n, _, err := packetConn.ReadFrom(buf)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if string(buf[:n]) != "turn-ok" {
++		t.Fatalf("unexpected payload: %q", buf[:n])
++	}
++}
+diff --git a/protocol/wireguard/outbound.go b/protocol/wireguard/outbound.go
+new file mode 100644
+index 000000000..ad5d99a74
+--- /dev/null
++++ b/protocol/wireguard/outbound.go
+@@ -0,0 +1,155 @@
++package wireguard
++
++import (
++	"context"
++	"net"
++	"net/netip"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/adapter/outbound"
++	"github.com/sagernet/sing-box/common/dialer"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing-box/transport/wireguard"
++	"github.com/sagernet/sing/common"
++	E "github.com/sagernet/sing/common/exceptions"
++	"github.com/sagernet/sing/common/logger"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++	"github.com/sagernet/sing/service"
++)
++
++func RegisterOutbound(registry *outbound.Registry) {
++	outbound.Register[option.LegacyWireGuardOutboundOptions](registry, C.TypeWireGuard, NewOutbound)
++}
++
++type Outbound struct {
++	outbound.Adapter
++	ctx            context.Context
++	dnsRouter      adapter.DNSRouter
++	logger         logger.ContextLogger
++	localAddresses []netip.Prefix
++	endpoint       *wireguard.Endpoint
++}
++
++func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.LegacyWireGuardOutboundOptions) (adapter.Outbound, error) {
++	outbound := &Outbound{
++		Adapter:        outbound.NewAdapterWithDialerOptions(C.TypeWireGuard, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
++		ctx:            ctx,
++		dnsRouter:      service.FromContext[adapter.DNSRouter](ctx),
++		logger:         logger,
++		localAddresses: options.LocalAddress,
++	}
++	if options.Detour != "" && options.GSO {
++		return nil, E.New("gso is conflict with detour")
++	}
++	outboundDialer, err := dialer.NewWithOptions(dialer.Options{
++		Context: ctx,
++		Options: options.DialerOptions,
++		RemoteIsDomain: options.ServerIsDomain() || common.Any(options.Peers, func(it option.LegacyWireGuardPeer) bool {
++			return it.ServerIsDomain()
++		}),
++		ResolverOnDetour: true,
++	})
++	if err != nil {
++		return nil, err
++	}
++	peers := common.Map(options.Peers, func(it option.LegacyWireGuardPeer) wireguard.PeerOptions {
++		return wireguard.PeerOptions{
++			Endpoint:     it.ServerOptions.Build(),
++			PublicKey:    it.PublicKey,
++			PreSharedKey: it.PreSharedKey,
++			AllowedIPs:   it.AllowedIPs,
++			// PersistentKeepaliveInterval: time.Duration(it.PersistentKeepaliveInterval),
++			Reserved: it.Reserved,
++		}
++	})
++	if len(peers) == 0 {
++		peers = []wireguard.PeerOptions{{
++			Endpoint:     options.ServerOptions.Build(),
++			PublicKey:    options.PeerPublicKey,
++			PreSharedKey: options.PreSharedKey,
++			AllowedIPs:   []netip.Prefix{netip.PrefixFrom(netip.IPv4Unspecified(), 0), netip.PrefixFrom(netip.IPv6Unspecified(), 0)},
++			Reserved:     options.Reserved,
++		}}
++	}
++	wgEndpoint, err := wireguard.NewEndpoint(wireguard.EndpointOptions{
++		Context: ctx,
++		Logger:  logger,
++		System:  options.SystemInterface,
++		Dialer:  outboundDialer,
++		CreateDialer: func(interfaceName string) N.Dialer {
++			return common.Must1(dialer.NewDefault(ctx, option.DialerOptions{
++				BindInterface: interfaceName,
++			}))
++		},
++		Name:       options.InterfaceName,
++		MTU:        options.MTU,
++		Address:    options.LocalAddress,
++		PrivateKey: options.PrivateKey,
++		ResolvePeer: func(domain string) (netip.Addr, error) {
++			endpointAddresses, lookupErr := outbound.dnsRouter.Lookup(ctx, domain, outboundDialer.(dialer.ResolveDialer).QueryOptions())
++			if lookupErr != nil {
++				return netip.Addr{}, lookupErr
++			}
++			return endpointAddresses[0], nil
++		},
++		Peers:   peers,
++		Workers: options.Workers,
++	})
++	if err != nil {
++		return nil, err
++	}
++	outbound.endpoint = wgEndpoint
++	return outbound, nil
++}
++
++func (o *Outbound) Start(stage adapter.StartStage) error {
++	switch stage {
++	case adapter.StartStateStart:
++		return o.endpoint.Start(false)
++	case adapter.StartStatePostStart:
++		return o.endpoint.Start(true)
++	}
++	return nil
++}
++
++func (o *Outbound) Close() error {
++	return o.endpoint.Close()
++}
++
++func (o *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++	switch network {
++	case N.NetworkTCP:
++		o.logger.InfoContext(ctx, "outbound connection to ", destination)
++	case N.NetworkUDP:
++		o.logger.InfoContext(ctx, "outbound packet connection to ", destination)
++	}
++	if destination.IsFqdn() {
++		destinationAddresses, err := o.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
++		if err != nil {
++			return nil, err
++		}
++		return N.DialSerial(ctx, o.endpoint, network, destination, destinationAddresses)
++	} else if !destination.Addr.IsValid() {
++		return nil, E.New("invalid destination: ", destination)
++	}
++	return o.endpoint.DialContext(ctx, network, destination)
++}
++
++func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
++	o.logger.InfoContext(ctx, "outbound packet connection to ", destination)
++	if destination.IsFqdn() {
++		destinationAddresses, err := o.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
++		if err != nil {
++			return nil, err
++		}
++		packetConn, _, err := N.ListenSerial(ctx, o.endpoint, destination, destinationAddresses)
++		if err != nil {
++			return nil, err
++		}
++		return packetConn, err
++	}
++	return o.endpoint.ListenPacket(ctx, destination)
++}
