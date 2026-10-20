@@ -22,6 +22,11 @@ class DnsProxyPreference
         setEntryValues(R.array.dns_proxy_value)
     }
 
+    // Preference.notifyChanged() is protected, expose it for the settings fragment
+    public override fun notifyChanged() {
+        super.notifyChanged()
+    }
+
     override fun getSummary(): CharSequence? {
         if (value == "3") {
             val proxyId = DataStore.remoteDnsProxy
